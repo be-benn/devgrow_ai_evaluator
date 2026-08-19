@@ -1,0 +1,19 @@
+Django>=5.0,<7.0
+djangorestframework>=3.15
+python-dotenv>=1.0
+
+# LLM
+langchain-core>=0.3
+langchain-ollama>=0.3
+
+# Tracing (optional)
+langfuse>=2.0
+
+# Validation
+pydantic>=2.0
+
+# Retry
+tenacity>=8.0
+
+# Tree-sitter
+tree-sitter-language-pack>=0.7
