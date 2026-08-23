@@ -1,6 +1,7 @@
 # Environment
 .env
-
+metrics_service.py
+static
 # Python
 __pycache__/
 __pycache__
@@ -25,3 +26,6 @@ staticfiles/
 # OS
 .DS_Store
 Thumbs.db
+
+#Other
+references
