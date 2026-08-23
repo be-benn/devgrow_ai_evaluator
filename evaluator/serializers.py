@@ -11,7 +11,7 @@ class EvaluationRequestSerializer(serializers.Serializer):
     acceptance_criteria = serializers.CharField()
     repository_path = serializers.CharField()
     base_commit = serializers.CharField()
-    target_commit = serializers.CharField()
+    target_commit = serializers.CharField(allow_blank=True)
     branch = serializers.CharField(required=False, allow_blank=True)
     difficulty = serializers.CharField(required=False, default="MEDIUM")
 
