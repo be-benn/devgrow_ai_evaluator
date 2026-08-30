@@ -17,3 +17,6 @@ tenacity>=8.0
 
 # Tree-sitter
 tree-sitter-language-pack>=0.7
+
+# PostgreSQL
+psycopg[binary]>=3.1

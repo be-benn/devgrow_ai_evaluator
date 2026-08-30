@@ -31,14 +31,14 @@ DevGrow AI Evaluator transitions code evaluation from naive diff inspection into
          ┌────────────────────────────────────────────────────────┐
          │              Evaluation Service Pipeline               │
          ├────────────────────────────────────────────────────────┤
-         │ 1. Acceptance Criteria Normalization                  │
-         │ 2. Git Diff Analysis & Sensitive File Filtering       │
+         │ 1. Acceptance Criteria Normalization                   │
+         │ 2. Git Diff Analysis & Sensitive File Filtering        │
          │ 3. Tree-sitter AST Parsing & Context Extraction        │
-         │ 4. Structure-Aware Code Chunking                      │
-         │ 5. Chunk-level LLM Evaluation (Observable Facts)      │
-         │ 6. Findings Consolidation & Deduplication             │
-         │ 7. Final Rubric Scoring LLM Pass                      │
-         │ 8. Deterministic Score Aggregation & Response         │
+         │ 4. Structure-Aware Code Chunking                       │
+         │ 5. Chunk-level LLM Evaluation (Observable Facts)       │
+         │ 6. Findings Consolidation & Deduplication              │
+         │ 7. Final Rubric Scoring LLM Pass                       │
+         │ 8. Deterministic Score Aggregation & Response          │
          └───────────────────────────┬────────────────────────────┘
                                      │
                                      ▼
@@ -81,11 +81,11 @@ DevGrow AI Evaluator transitions code evaluation from naive diff inspection into
 
 ### Step 7: Final Rubric Scoring
 - `_final_scoring()` sends the consolidated findings, project context, and acceptance criteria to the LLM.
-- The LLM scores the code across 4 structured dimensions.
+- The LLM scores the code across 2 structured dimensions.
 
 ### Step 8: Deterministic Score Computation
-- The system sums the 4 rubric dimensions in code:
-  $$\text{Final Score} = \min(\text{Requirement Coverage} + \text{Correctness} + \text{Code Quality} + \text{Best Practices}, 100)$$
+- The system sums the 2 rubric dimensions in code and normalizes to a 100-point scale:
+  $$\text{Final Score} = \text{round}\left(\frac{\text{Requirement Coverage} + \text{Correctness}}{65} \times 100\right)$$
 - Returns the complete result conforming to the evaluation contract.
 
 ---
@@ -142,15 +142,13 @@ d:/devgrow_ai_evaluator/
 
 ## Scoring Rubric & Criteria
 
-The evaluation uses a **100-point fixed rubric**:
+The evaluation uses a **65-point fixed rubric**, normalized to a 100-point scale:
 
 | Category | Points Range | Description |
 | :--- | :---: | :--- |
 | **Requirement Coverage** | `0 - 40` | Does the code implement all specified acceptance criteria? |
 | **Correctness** | `0 - 25` | Is the logic bug-free, robust, and correctly structured? |
-| **Code Quality** | `0 - 20` | Is the code clean, readable, modular, and maintainable? |
-| **Best Practices** | `0 - 15` | Does it follow language-specific conventions and security standards? |
-| **Total Score** | `0 - 100` | Sum of all four categories. |
+| **Total (raw)** | `0 - 65` | Sum of both categories, normalized to 0–100. |
 
 ### Status Thresholds
 - **Met**: Requirement Coverage $\ge 30$ points
@@ -194,10 +192,8 @@ The evaluation uses a **100-point fixed rubric**:
     "Comprehensive docstrings and type annotations provided on the coupon view."
   ],
   "rubric": {
-    "requirement_coverage": 36,
-    "correctness": 22,
-    "code_quality": 17,
-    "best_practices": 13
+    "requirement_coverage": 35,
+    "correctness": 22
   }
 }
 ```

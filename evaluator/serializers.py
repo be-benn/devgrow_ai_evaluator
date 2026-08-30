@@ -16,19 +16,19 @@ class EvaluationRequestSerializer(serializers.Serializer):
     difficulty = serializers.CharField(required=False, default="MEDIUM")
 
 
-class RubricSerializer(serializers.Serializer):
-    """Nested rubric scores."""
-
-    requirement_coverage = serializers.IntegerField()
-    correctness = serializers.IntegerField()
-
-
 class EvaluationResponseSerializer(serializers.Serializer):
-    """DRF serializer for the evaluation API response (V1-compatible)."""
+    """DRF serializer for the evaluation API response."""
 
     score = serializers.IntegerField()
     status = serializers.CharField()
     summary = serializers.CharField()
     issues = serializers.ListField(child=serializers.CharField())
     strengths = serializers.ListField(child=serializers.CharField())
-    rubric = RubricSerializer()
+    rubric = serializers.DictField()
+
+
+class ScoringMetricSerializer(serializers.Serializer):
+    """Serializer for a single scoring metric."""
+
+    name = serializers.CharField(max_length=100)
+    display_name = serializers.CharField(max_length=100)

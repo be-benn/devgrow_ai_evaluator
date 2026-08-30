@@ -19,15 +19,34 @@ from evaluator.services.git_service import GitService
 from evaluator.services.parser_service import parse_changed_code
 from evaluator.services.chunker_service import create_chunks
 from evaluator.services.llm_service import get_llm_json_response
+from evaluator.models import EvaluationResult, ScoringMetric
+from collections import namedtuple
 
 
 logger = logging.getLogger(__name__)
 
 
-ZERO_RUBRIC = {
-    "requirement_coverage": 0,
-    "correctness": 0,
-}
+_MetricDef = namedtuple("_MetricDef", ["name", "display_name"])
+
+DEFAULT_METRICS = [
+    _MetricDef("requirement_coverage", "Requirement Coverage"),
+    _MetricDef("correctness", "Code Correctness"),
+]
+
+
+def _zero_rubric(metrics):
+    """Build a zero-score rubric dict from active metrics."""
+    return {m.name: 0 for m in metrics}
+
+
+def _get_metrics():
+    """Return hardcoded defaults + any extra metrics from DB (max 5 total)."""
+    extras = ScoringMetric.get_extra_metrics()
+    extra_defs = [
+        _MetricDef(m.name, m.display_name)
+        for m in extras
+    ]
+    return DEFAULT_METRICS + extra_defs
 
 
 def evaluate(request: EvaluationRequest) -> EvaluationResponse:
@@ -47,6 +66,30 @@ def evaluate(request: EvaluationRequest) -> EvaluationResponse:
     2. base_commit + target_commit=""
        -> complete supported source files from base_commit are evaluated
     """
+
+    # ── Cache check ──────────────────────────────────────────
+    cached = EvaluationResult.get_cached(
+        repository_path=request.repository_path,
+        base_commit=request.base_commit,
+        target_commit=request.target_commit,
+        task_title=request.task_title,
+    )
+
+    if cached:
+        logger.info(
+            "Cache hit for task=%r, target=%s. Returning stored result.",
+            cached.task_title,
+            cached.target_commit[:8],
+        )
+
+        return EvaluationResponse(
+            score=cached.score,
+            status=cached.status,
+            summary=cached.summary,
+            issues=cached.issues,
+            strengths=cached.strengths,
+            rubric=cached.rubric,
+        )
 
     repository_value = request.repository_path
 
@@ -90,7 +133,7 @@ def evaluate(request: EvaluationRequest) -> EvaluationResponse:
                     f"Repository error: {e}"
                 ],
                 strengths=[],
-                rubric=ZERO_RUBRIC.copy(),
+                rubric=_zero_rubric(_get_metrics()),
             )
 
     # ── Local repository path ───────────────────────────────
@@ -119,6 +162,9 @@ def _run_evaluation(
     10. Return evaluation response
     """
 
+    # ── Step 0: Fetch active scoring metrics ────────────────
+    metrics = _get_metrics()
+
     # ── Step 1: Normalize acceptance criteria ───────────────
     criteria_list = normalize_acceptance_criteria(
         request.acceptance_criteria
@@ -133,7 +179,7 @@ def _run_evaluation(
                 "No acceptance criteria to evaluate against."
             ],
             strengths=[],
-            rubric=ZERO_RUBRIC.copy(),
+            rubric=_zero_rubric(metrics),
         )
 
     logger.info(
@@ -186,7 +232,7 @@ def _run_evaluation(
                     ),
                     issues=[],
                     strengths=[],
-                    rubric=ZERO_RUBRIC.copy(),
+                    rubric=_zero_rubric(metrics),
                 )
 
         # ----------------------------------------------------
@@ -234,7 +280,7 @@ def _run_evaluation(
                     ),
                     issues=[],
                     strengths=[],
-                    rubric=ZERO_RUBRIC.copy(),
+                    rubric=_zero_rubric(metrics),
                 )
 
     except Exception as e:
@@ -251,7 +297,7 @@ def _run_evaluation(
                 f"Git error: {e}"
             ],
             strengths=[],
-            rubric=ZERO_RUBRIC.copy(),
+            rubric=_zero_rubric(metrics),
         )
 
     logger.info(
@@ -339,7 +385,7 @@ def _run_evaluation(
                 "or contained no supported code."
             ],
             strengths=[],
-            rubric=ZERO_RUBRIC.copy(),
+            rubric=_zero_rubric(metrics),
         )
 
     logger.info(
@@ -389,6 +435,7 @@ def _run_evaluation(
             task_description=request.task_description,
             criteria_text=criteria_text,
             difficulty=request.difficulty,
+            metrics=metrics,
         )
 
         all_strengths.extend(
@@ -432,46 +479,64 @@ def _run_evaluation(
         unique_issues=unique_issues,
         unique_strengths=unique_strengths,
         unique_evidence=unique_evidence,
+        metrics=metrics,
     )
 
     # ── Step 8: Functional score ────────────────────────────
     #
-    # Only requirement coverage + correctness affect
-    # the final score.
+    # Each metric is scored 0–100.
+    # Final score = sum(scores) / (num_metrics * 100) * 100
     #
-    # Maximum:
-    # requirement_coverage = 40
-    # correctness          = 25
-    # total                = 65
-    #
-    functional_score = (
-        rubric.requirement_coverage
-        + rubric.correctness
-    )
+    metric_count = len(metrics)
+    total = sum(rubric.scores.values())
+    max_possible = metric_count * 100
 
     final_score = round(
-        (functional_score / 200) * 100
-    )
+        (total / max_possible) * 100
+    ) if max_possible > 0 else 0
 
     logger.info(
-        "Step 8: Final score = %d, status = %s.",
+        "Step 8: Final score = %d (%d metrics), status = %s.",
         final_score,
+        metric_count,
         rubric.criteria_status,
     )
 
     # ── Step 9: Response ────────────────────────────────────
+    result_rubric = rubric.scores
+
+    result_issues = unique_issues
+    result_strengths = unique_strengths[:5]
+
+    # ── Persist to DB ───────────────────────────────────────
+    try:
+        EvaluationResult.objects.update_or_create(
+            repository_path=request.repository_path,
+            base_commit=request.base_commit,
+            target_commit=request.target_commit,
+            task_title=request.task_title,
+            defaults={
+                "score": final_score,
+                "status": rubric.criteria_status,
+                "summary": rubric.summary,
+                "issues": result_issues,
+                "strengths": result_strengths,
+                "rubric": result_rubric,
+            },
+        )
+    except Exception as e:
+        logger.warning(
+            "Failed to cache evaluation result: %s",
+            e,
+        )
+
     return EvaluationResponse(
         score=final_score,
         status=rubric.criteria_status,
         summary=rubric.summary,
-        issues=unique_issues,
-        strengths=unique_strengths[:5],
-        rubric={
-            "requirement_coverage":
-                rubric.requirement_coverage,
-            "correctness":
-                rubric.correctness,
-        },
+        issues=result_issues,
+        strengths=result_strengths,
+        rubric=result_rubric,
     )
 
 
@@ -488,7 +553,12 @@ def _evaluate_chunk(
     task_description: str,
     criteria_text: str,
     difficulty: str,
+    metrics: list = None,
 ) -> ChunkEvaluationResult:
+
+    metric_tags = ", ".join(
+        f"[{m.display_name}]" for m in (metrics or [])
+    ) or "[Requirement Coverage], [Code Correctness]"
 
     prompt = f"""
 You are a Senior Code Reviewer. Analyze Part {chunk_index}/{total_chunks} of the submitted code.
@@ -519,12 +589,14 @@ You are a Senior Code Reviewer. Analyze Part {chunk_index}/{total_chunks} of the
 
 
 **OUTPUT JSON ONLY:**
+Each strength and issue MUST start with a metric tag indicating which evaluation
+dimension it relates to. Use one of: {metric_tags}.
 {{
   "strengths": [
-    "List specific strengths DIRECTLY visible in THIS chunk"
+    "[{(metrics or [])[0].display_name if metrics else 'Requirement Coverage'}] Example: Implements all required CRUD endpoints"
   ],
   "issues": [
-    "List specific issues DIRECTLY visible in THIS chunk"
+    "[{(metrics or [])[0].display_name if metrics else 'Requirement Coverage'}] Example: Missing pagination as specified in criteria"
   ],
   "evidence": [
     "Direct code quotes or references supporting your findings"
@@ -582,7 +654,24 @@ def _final_scoring(
     unique_issues: list,
     unique_strengths: list,
     unique_evidence: list,
+    metrics: list = None,
 ) -> RubricScore:
+
+    metric_names = [m.name for m in (metrics or [])]
+
+    rubric_lines = "\n".join(
+        f"- {name} : 0\u2013100"
+        for name in metric_names
+    ) or "- requirement_coverage : 0\u2013100\n- correctness : 0\u2013100"
+
+    output_fields = "\n".join(
+        f"- {name}: integer from 0 to 100"
+        for name in metric_names
+    )
+    output_fields += "\n- criteria_status: one of \"Met\", \"Partially Met\", or \"Not Met\""
+    output_fields += "\n- summary: one concise sentence based only on the consolidated findings"
+
+    first_metric = metric_names[0] if metric_names else "requirement_coverage"
 
     prompt = f"""
 You are a Code Evaluation Judge. Score the submitted code using a FIXED rubric.
@@ -600,28 +689,36 @@ Issues   : {unique_issues}
 Strengths: {unique_strengths}
 Evidence : {unique_evidence}
 
-**SCORING RUBRIC — assign points within each stated range:**
-- requirement_coverage : 0–100
-- correctness          : 0–100
+**SCORING RUBRIC \u2014 assign points within each stated range:**
+{rubric_lines}
+
+**SCORING GUIDELINES:**
+- If a criterion is partially implemented, give proportional credit (e.g. 50\u201370
+  for a reasonable attempt) rather than 0.
+- Minor issues (styling, naming, small edge cases) should NOT heavily reduce
+  the score. Deduct lightly for minor issues.
+- Working code that fulfills the core intent of a criterion should score well,
+  even if the implementation is not identical to the ideal approach.
+- Reserve very low scores (below 20) only for submissions where the criterion
+  is truly absent or fundamentally broken.
+- If more strengths than issues are reported, scores should lean toward the
+  higher end of the range.
 
 **RULES:**
 - Base scores ONLY on the consolidated findings above.
 - DO NOT invent new implementation details, defects, or assumptions.
 - When required functionality is absent from the complete evaluated submission
   scope, state that clearly rather than saying it is "not present in this chunk".
-- If requirement_coverage is 0 because none of the requested functionality
-  is implemented, correctness must also be 0.
+- If {first_metric} is 0 because none of the requested functionality
+  is implemented, all other metrics must also be 0.
 - DO NOT return a total score.
 - criteria_status:
-    "Met" if requirement_coverage >= 30,
-    "Partially Met" if requirement_coverage >= 15,
+    "Met" if {first_metric} >= 30,
+    "Partially Met" if {first_metric} >= 15,
     else "Not Met".
 
 **OUTPUT JSON ONLY. Return these fields:**
-- requirement_coverage: integer from 0 to 100
-- correctness: integer from 0 to 100
-- criteria_status: one of "Met", "Partially Met", or "Not Met"
-- summary: one concise sentence based only on the consolidated findings
+{output_fields}
 """
 
     try:
@@ -629,8 +726,20 @@ Evidence : {unique_evidence}
             prompt
         )
 
+        # Extract metric scores from the flat LLM response
+        scores = {
+            name: raw.get(name, 0)
+            for name in metric_names
+        }
+
         return RubricScore(
-            **raw
+            scores=scores,
+            criteria_status=raw.get(
+                "criteria_status", "Not Met"
+            ),
+            summary=raw.get(
+                "summary", ""
+            ),
         )
 
     except ValidationError as e:
@@ -640,7 +749,8 @@ Evidence : {unique_evidence}
         )
 
         return _extract_rubric_gracefully(
-            raw if "raw" in dir() else {}
+            raw if "raw" in dir() else {},
+            metric_names,
         )
 
     except Exception as e:
@@ -650,8 +760,7 @@ Evidence : {unique_evidence}
         )
 
         return RubricScore(
-            requirement_coverage=0,
-            correctness=0,
+            scores={name: 0 for name in metric_names},
             criteria_status="Not Met",
             summary=f"Final scoring failed: {e}",
         )
@@ -691,7 +800,11 @@ def _extract_chunk_result_gracefully(
 
 def _extract_rubric_gracefully(
     raw: dict,
+    metric_names: list = None,
 ) -> RubricScore:
+
+    if metric_names is None:
+        metric_names = ["requirement_coverage", "correctness"]
 
     def clamp(val, lo, hi):
         try:
@@ -705,23 +818,13 @@ def _extract_rubric_gracefully(
         except (TypeError, ValueError):
             return lo
 
+    scores = {
+        name: clamp(raw.get(name, 0), 0, 100)
+        for name in metric_names
+    }
+
     return RubricScore(
-        requirement_coverage=clamp(
-            raw.get(
-                "requirement_coverage",
-                0,
-            ),
-            0,
-            100,
-        ),
-        correctness=clamp(
-            raw.get(
-                "correctness",
-                0,
-            ),
-            0,
-            100,
-        ),
+        scores=scores,
         criteria_status=raw.get(
             "criteria_status",
             "Not Met",

@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -14,10 +14,9 @@ class ChunkEvaluationResult(BaseModel):
 
 # ── Final rubric score ──────────────────────────────────────
 class RubricScore(BaseModel):
-    """Validates the final scoring LLM response."""
+    """Validates the final scoring LLM response with dynamic metric keys."""
 
-    requirement_coverage: int = Field(ge=0, le=100)
-    correctness: int = Field(ge=0, le=100)
+    scores: Dict[str, int] = Field(default_factory=dict)
     criteria_status: str
     summary: str
 
