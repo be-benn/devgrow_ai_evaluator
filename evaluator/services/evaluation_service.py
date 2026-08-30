@@ -27,8 +27,6 @@ logger = logging.getLogger(__name__)
 ZERO_RUBRIC = {
     "requirement_coverage": 0,
     "correctness": 0,
-    "code_quality": 0,
-    "best_practices": 0,
 }
 
 
@@ -36,16 +34,18 @@ def evaluate(request: EvaluationRequest) -> EvaluationResponse:
     """
     Public entry point for evaluation.
 
-    repository_path currently supports:
+    repository_path supports:
     1. Local Git repository path
     2. Remote Git repository URL
 
     Evaluation modes:
+
     1. base_commit + target_commit
-       -> evaluate changes between both revisions
+       -> Git diff identifies changed files
+       -> complete target version of changed files is evaluated
 
     2. base_commit + target_commit=""
-       -> evaluate all supported files from base_commit
+       -> complete supported source files from base_commit are evaluated
     """
 
     repository_value = request.repository_path
@@ -85,9 +85,7 @@ def evaluate(request: EvaluationRequest) -> EvaluationResponse:
             return EvaluationResponse(
                 score=0,
                 status="Not Met",
-                summary=(
-                    f"Repository preparation failed: {e}"
-                ),
+                summary=f"Repository preparation failed: {e}",
                 issues=[
                     f"Repository error: {e}"
                 ],
@@ -95,7 +93,7 @@ def evaluate(request: EvaluationRequest) -> EvaluationResponse:
                 rubric=ZERO_RUBRIC.copy(),
             )
 
-    # ── Existing local-path behavior ────────────────────────
+    # ── Local repository path ───────────────────────────────
     return _run_evaluation(
         request=request,
         repository_path=repository_value,
@@ -111,13 +109,14 @@ def _run_evaluation(
 
     1. Normalize acceptance criteria
     2. Perform Git analysis
-    3. Read selected files directly from Git revision
-    4. Parse changed/full code
-    5. Create chunks
-    6. Evaluate chunks using LLM
-    7. Consolidate findings
-    8. Final scoring
-    9. Return evaluation response
+    3. Identify files in student scope
+    4. Read complete source from selected revision
+    5. Parse complete files
+    6. Create chunks
+    7. Evaluate chunks using LLM
+    8. Consolidate findings
+    9. Final scoring
+    10. Return evaluation response
     """
 
     # ── Step 1: Normalize acceptance criteria ───────────────
@@ -150,8 +149,10 @@ def _run_evaluation(
 
         # ----------------------------------------------------
         # CASE 1:
-        # target_commit is provided.
-        # Evaluate changes between base and target.
+        # target_commit is supplied.
+        #
+        # Git diff determines which files belong to
+        # the submitted student change.
         # ----------------------------------------------------
         if request.target_commit:
 
@@ -191,7 +192,8 @@ def _run_evaluation(
         # ----------------------------------------------------
         # CASE 2:
         # target_commit == ""
-        # Evaluate complete source from base_commit.
+        #
+        # Evaluate the complete base branch.
         # ----------------------------------------------------
         else:
 
@@ -199,16 +201,13 @@ def _run_evaluation(
                 request.base_commit
             )
 
-            # Reuse the existing target-reading pipeline.
-            # In single-branch mode, target == base.
+            # Reuse the existing target-reading flow.
             target_sha = base_sha
 
             files = git_service.get_files_at_revision(
                 request.base_commit
             )
 
-            # Mark all files as "added" only so the existing
-            # parser evaluates the complete file.
             changes = [
                 {
                     "change_type": "added",
@@ -230,8 +229,8 @@ def _run_evaluation(
                     score=0,
                     status="Not Met",
                     summary=(
-                        "No files found in the supplied "
-                        "base branch."
+                        "No supported source files found "
+                        "in the supplied base branch."
                     ),
                     issues=[],
                     strengths=[],
@@ -270,13 +269,12 @@ def _run_evaluation(
         len(changes),
     )
 
-    # ── Step 3: Read source + parse ─────────────────────────
+    # ── Step 3: Read COMPLETE source + parse ────────────────
     all_fragments = []
 
     for change in changes:
 
-        # Deleted-file evaluation is intentionally
-        # postponed for now.
+        # Deleted-file evaluation is postponed for now.
         if change.get("change_type") == "deleted":
             continue
 
@@ -288,7 +286,13 @@ def _run_evaluation(
         if not file_path:
             continue
 
-        # Read directly from the selected Git revision.
+        # Read the COMPLETE file from the selected target revision.
+        #
+        # Diff mode:
+        #   target_sha = student's target branch
+        #
+        # Single-branch mode:
+        #   target_sha = base_sha
         content = git_service.read_file_at_revision(
             target_sha,
             file_path,
@@ -302,18 +306,23 @@ def _run_evaluation(
             )
             continue
 
+        # IMPORTANT:
+        #
+        # Git diff already determined that this file belongs
+        # to the student's change scope.
+        #
+        # We now evaluate the COMPLETE target-side file so the
+        # LLM can also understand unchanged methods/classes that
+        # the student's new implementation depends on.
+        #
+        # Treating the file as "added" makes the existing parser
+        # return the complete file without changing parser_service.py.
         fragments = parse_changed_code(
             file_path=file_path,
             content=content,
-            change_type=change["change_type"],
-            added_lines=change.get(
-                "added_lines",
-                [],
-            ),
-            deleted_lines=change.get(
-                "deleted_lines",
-                [],
-            ),
+            change_type="added",
+            added_lines=[],
+            deleted_lines=[],
         )
 
         all_fragments.extend(
@@ -326,8 +335,8 @@ def _run_evaluation(
             status="Not Met",
             summary="No parseable code changes found.",
             issues=[
-                "Changed files could not be parsed "
-                "or contained no code."
+                "Selected files could not be parsed "
+                "or contained no supported code."
             ],
             strengths=[],
             rubric=ZERO_RUBRIC.copy(),
@@ -394,7 +403,7 @@ def _run_evaluation(
             chunk_result.evidence
         )
 
-    # ── Step 6: Consolidate findings ─────────────────────────
+    # ── Step 6: Consolidate findings ────────────────────────
     unique_strengths = _deduplicate(
         all_strengths
     )
@@ -413,7 +422,7 @@ def _run_evaluation(
         len(unique_strengths),
     )
 
-    # ── Step 7: Final LLM scoring ────────────────────────────
+    # ── Step 7: Final LLM scoring ───────────────────────────
     rubric = _final_scoring(
         project_title=request.project_title,
         project_description=request.project_description,
@@ -425,13 +434,23 @@ def _run_evaluation(
         unique_evidence=unique_evidence,
     )
 
-    # ── Step 8: Deterministic score ──────────────────────────
-    final_score = min(
+    # ── Step 8: Functional score ────────────────────────────
+    #
+    # Only requirement coverage + correctness affect
+    # the final score.
+    #
+    # Maximum:
+    # requirement_coverage = 40
+    # correctness          = 25
+    # total                = 65
+    #
+    functional_score = (
         rubric.requirement_coverage
         + rubric.correctness
-        + rubric.code_quality
-        + rubric.best_practices,
-        100,
+    )
+
+    final_score = round(
+        (functional_score / 200) * 100
     )
 
     logger.info(
@@ -440,7 +459,7 @@ def _run_evaluation(
         rubric.criteria_status,
     )
 
-    # ── Step 9: Response ─────────────────────────────────────
+    # ── Step 9: Response ────────────────────────────────────
     return EvaluationResponse(
         score=final_score,
         status=rubric.criteria_status,
@@ -452,10 +471,6 @@ def _run_evaluation(
                 rubric.requirement_coverage,
             "correctness":
                 rubric.correctness,
-            "code_quality":
-                rubric.code_quality,
-            "best_practices":
-                rubric.best_practices,
         },
     )
 
@@ -493,6 +508,15 @@ You are a Senior Code Reviewer. Analyze Part {chunk_index}/{total_chunks} of the
 3. DO NOT report issues about code that may exist in other chunks.
 4. DO NOT assign scores — only report observable facts.
 5. Focus on: Logic Errors, Hardcoding, Syntax issues, and Criteria implementation.
+6. If a referenced method, class, configuration, or behavior is not included
+   in this chunk, DO NOT assume it is missing, incorrect, or a stub.
+7. Treat missing context as insufficient evidence, not as a confirmed issue.
+8. Only report an issue when the defective implementation is directly visible
+   in the supplied code.
+9. Do not report an acceptance criterion as missing merely because its
+   implementation is not visible in this chunk. Another chunk may contain it.
+
+
 
 **OUTPUT JSON ONLY:**
 {{
@@ -577,29 +601,27 @@ Strengths: {unique_strengths}
 Evidence : {unique_evidence}
 
 **SCORING RUBRIC — assign points within each stated range:**
-- requirement_coverage : 0–40
-- correctness          : 0–25
-- code_quality         : 0–20
-- best_practices       : 0–15
+- requirement_coverage : 0–100
+- correctness          : 0–100
 
 **RULES:**
 - Base scores ONLY on the consolidated findings above.
-- DO NOT invent new issues.
+- DO NOT invent new implementation details, defects, or assumptions.
+- When required functionality is absent from the complete evaluated submission
+  scope, state that clearly rather than saying it is "not present in this chunk".
+- If requirement_coverage is 0 because none of the requested functionality
+  is implemented, correctness must also be 0.
 - DO NOT return a total score.
 - criteria_status:
     "Met" if requirement_coverage >= 30,
-    "Partially Met" if >= 15,
+    "Partially Met" if requirement_coverage >= 15,
     else "Not Met".
 
-**OUTPUT JSON ONLY (Example):**
-{{
-    "requirement_coverage": requirement_coverage_score,
-    "correctness": correctness_score,
-    "code_quality": code_quality_score,
-    "best_practices": best_practices_score,
-    "criteria_status": "Met",
-    "summary": "One sentence summarising the overall evaluation."
-}}
+**OUTPUT JSON ONLY. Return these fields:**
+- requirement_coverage: integer from 0 to 100
+- correctness: integer from 0 to 100
+- criteria_status: one of "Met", "Partially Met", or "Not Met"
+- summary: one concise sentence based only on the consolidated findings
 """
 
     try:
@@ -630,8 +652,6 @@ Evidence : {unique_evidence}
         return RubricScore(
             requirement_coverage=0,
             correctness=0,
-            code_quality=0,
-            best_practices=0,
             criteria_status="Not Met",
             summary=f"Final scoring failed: {e}",
         )
@@ -692,7 +712,7 @@ def _extract_rubric_gracefully(
                 0,
             ),
             0,
-            40,
+            100,
         ),
         correctness=clamp(
             raw.get(
@@ -700,23 +720,7 @@ def _extract_rubric_gracefully(
                 0,
             ),
             0,
-            25,
-        ),
-        code_quality=clamp(
-            raw.get(
-                "code_quality",
-                0,
-            ),
-            0,
-            20,
-        ),
-        best_practices=clamp(
-            raw.get(
-                "best_practices",
-                0,
-            ),
-            0,
-            15,
+            100,
         ),
         criteria_status=raw.get(
             "criteria_status",

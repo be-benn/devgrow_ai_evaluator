@@ -21,8 +21,6 @@ class RubricSerializer(serializers.Serializer):
 
     requirement_coverage = serializers.IntegerField()
     correctness = serializers.IntegerField()
-    code_quality = serializers.IntegerField()
-    best_practices = serializers.IntegerField()
 
 
 class EvaluationResponseSerializer(serializers.Serializer):

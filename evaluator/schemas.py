@@ -16,10 +16,8 @@ class ChunkEvaluationResult(BaseModel):
 class RubricScore(BaseModel):
     """Validates the final scoring LLM response."""
 
-    requirement_coverage: int = Field(ge=0, le=40)
-    correctness: int = Field(ge=0, le=25)
-    code_quality: int = Field(ge=0, le=20)
-    best_practices: int = Field(ge=0, le=15)
+    requirement_coverage: int = Field(ge=0, le=100)
+    correctness: int = Field(ge=0, le=100)
     criteria_status: str
     summary: str
 
