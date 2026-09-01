@@ -59,15 +59,25 @@ def evaluate(request: EvaluationRequest) -> EvaluationResponse:
 
     Evaluation modes:
 
-    1. base_commit + target_commit
+    1. base_commit + target_commit are different
        -> Git diff identifies changed files
        -> complete target version of changed files is evaluated
 
-    2. base_commit + target_commit=""
+    2. base_commit + target_commit resolve to the same commit
+       -> GitService compares latest commit with its parent
+       -> only files changed in the latest commit are selected
+       -> complete latest versions of those files are evaluated
+
+    3. base_commit + target_commit resolve to the same initial commit
+       -> there is no parent commit
+       -> GitService treats all supported source files as newly added
+       -> complete initial-commit files are evaluated
+
+    4. target_commit is empty
        -> complete supported source files from base_commit are evaluated
     """
 
-    # ── Cache check ──────────────────────────────────────────
+        # ── Cache check ──────────────────────────────────────────
     cached = EvaluationResult.get_cached(
         repository_path=request.repository_path,
         base_commit=request.base_commit,
@@ -153,7 +163,7 @@ def _run_evaluation(
     1. Normalize acceptance criteria
     2. Perform Git analysis
     3. Identify files in student scope
-    4. Read complete source from selected revision
+    4. Read complete source from selected target revision
     5. Parse complete files
     6. Create chunks
     7. Evaluate chunks using LLM
@@ -197,8 +207,16 @@ def _run_evaluation(
         # CASE 1:
         # target_commit is supplied.
         #
-        # Git diff determines which files belong to
-        # the submitted student change.
+        # GitService handles:
+        #
+        # A. Different base and target
+        #    -> normal diff
+        #
+        # B. Same resolved base and target
+        #    -> parent(latest) vs latest
+        #
+        # C. Same resolved base and target + initial commit
+        #    -> all supported files treated as newly added
         # ----------------------------------------------------
         if request.target_commit:
 
@@ -227,8 +245,8 @@ def _run_evaluation(
                     score=0,
                     status="Not Met",
                     summary=(
-                        "No code changes found between "
-                        "the base and target commits."
+                        "No supported code changes found "
+                        "between the selected revisions."
                     ),
                     issues=[],
                     strengths=[],
@@ -239,7 +257,7 @@ def _run_evaluation(
         # CASE 2:
         # target_commit == ""
         #
-        # Evaluate the complete base branch.
+        # Evaluate the complete base branch/revision.
         # ----------------------------------------------------
         else:
 
@@ -247,7 +265,6 @@ def _run_evaluation(
                 request.base_commit
             )
 
-            # Reuse the existing target-reading flow.
             target_sha = base_sha
 
             files = git_service.get_files_at_revision(
@@ -315,12 +332,12 @@ def _run_evaluation(
         len(changes),
     )
 
-    # ── Step 3: Read COMPLETE source + parse ────────────────
+    # ── Step 3: Read COMPLETE target source ─────────────────
     all_fragments = []
 
     for change in changes:
 
-        # Deleted-file evaluation is postponed for now.
+        # Deleted-file evaluation remains postponed.
         if change.get("change_type") == "deleted":
             continue
 
@@ -332,10 +349,17 @@ def _run_evaluation(
         if not file_path:
             continue
 
-        # Read the COMPLETE file from the selected target revision.
+        # Read the complete file exactly as it exists
+        # in the selected target revision.
         #
-        # Diff mode:
-        #   target_sha = student's target branch
+        # Normal diff:
+        #   target_sha = requested target revision
+        #
+        # Same branch:
+        #   target_sha = latest branch commit
+        #
+        # Initial commit:
+        #   target_sha = initial commit
         #
         # Single-branch mode:
         #   target_sha = base_sha
@@ -352,17 +376,16 @@ def _run_evaluation(
             )
             continue
 
-        # IMPORTANT:
+        # Git already determined which files belong to the
+        # evaluation scope.
         #
-        # Git diff already determined that this file belongs
-        # to the student's change scope.
+        # The evaluator deliberately passes the COMPLETE
+        # target-side file to the LLM so surrounding methods,
+        # classes and dependencies inside that file remain
+        # available as context.
         #
-        # We now evaluate the COMPLETE target-side file so the
-        # LLM can also understand unchanged methods/classes that
-        # the student's new implementation depends on.
-        #
-        # Treating the file as "added" makes the existing parser
-        # return the complete file without changing parser_service.py.
+        # Treating it as "added" makes parser_service return
+        # the complete file as one ParsedCodeFragment.
         fragments = parse_changed_code(
             file_path=file_path,
             content=content,
@@ -399,6 +422,18 @@ def _run_evaluation(
     )
 
     total_chunks = len(chunks)
+
+    if total_chunks == 0:
+        return EvaluationResponse(
+            score=0,
+            status="Not Met",
+            summary="No evaluable code chunks were generated.",
+            issues=[
+                "Selected source files produced no evaluable chunks."
+            ],
+            strengths=[],
+            rubric=_zero_rubric(metrics),
+        )
 
     logger.info(
         "Step 4: %d chunk(s) created.",
@@ -483,7 +518,6 @@ def _run_evaluation(
     )
 
     # ── Step 8: Functional score ────────────────────────────
-    #
     # Each metric is scored 0–100.
     # Final score = sum(scores) / (num_metrics * 100) * 100
     #
@@ -508,27 +542,29 @@ def _run_evaluation(
     result_issues = unique_issues
     result_strengths = unique_strengths[:5]
 
-    # ── Persist to DB ───────────────────────────────────────
-    try:
-        EvaluationResult.objects.update_or_create(
-            repository_path=request.repository_path,
-            base_commit=request.base_commit,
-            target_commit=request.target_commit,
-            task_title=request.task_title,
-            defaults={
-                "score": final_score,
-                "status": rubric.criteria_status,
-                "summary": rubric.summary,
-                "issues": result_issues,
-                "strengths": result_strengths,
-                "rubric": result_rubric,
-            },
-        )
-    except Exception as e:
-        logger.warning(
-            "Failed to cache evaluation result: %s",
-            e,
-        )
+    # ── Persist to DB (only on successful evaluation) ──────
+    is_successful = not rubric.summary.startswith("Final scoring failed:")
+    if is_successful:
+        try:
+            EvaluationResult.objects.update_or_create(
+                repository_path=request.repository_path,
+                base_commit=request.base_commit,
+                target_commit=request.target_commit,
+                task_title=request.task_title,
+                defaults={
+                    "score": final_score,
+                    "status": rubric.criteria_status,
+                    "summary": rubric.summary,
+                    "issues": result_issues,
+                    "strengths": result_strengths,
+                    "rubric": result_rubric,
+                },
+            )
+        except Exception as e:
+            logger.warning(
+                "Failed to cache evaluation result: %s",
+                e,
+            )
 
     return EvaluationResponse(
         score=final_score,
@@ -537,8 +573,7 @@ def _run_evaluation(
         issues=result_issues,
         strengths=result_strengths,
         rubric=result_rubric,
-    )
-
+)
 
 # ── Private helpers ─────────────────────────────────────────
 
@@ -559,6 +594,7 @@ def _evaluate_chunk(
     metric_tags = ", ".join(
         f"[{m.display_name}]" for m in (metrics or [])
     ) or "[Requirement Coverage], [Code Correctness]"
+
 
     prompt = f"""
 You are a Senior Code Reviewer. Analyze Part {chunk_index}/{total_chunks} of the submitted code.
@@ -585,8 +621,6 @@ You are a Senior Code Reviewer. Analyze Part {chunk_index}/{total_chunks} of the
    in the supplied code.
 9. Do not report an acceptance criterion as missing merely because its
    implementation is not visible in this chunk. Another chunk may contain it.
-
-
 
 **OUTPUT JSON ONLY:**
 Each strength and issue MUST start with a metric tag indicating which evaluation
@@ -672,6 +706,7 @@ def _final_scoring(
     output_fields += "\n- summary: one concise sentence based only on the consolidated findings"
 
     first_metric = metric_names[0] if metric_names else "requirement_coverage"
+
 
     prompt = f"""
 You are a Code Evaluation Judge. Score the submitted code using a FIXED rubric.
@@ -760,7 +795,7 @@ Evidence : {unique_evidence}
         )
 
         return RubricScore(
-            scores={name: 0 for name in metric_names},
+            scores = {name:0 for name in metric_names},
             criteria_status="Not Met",
             summary=f"Final scoring failed: {e}",
         )

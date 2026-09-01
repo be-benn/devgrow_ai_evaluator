@@ -5,24 +5,28 @@ from typing import List, Optional
 from urllib.parse import urlparse
 
 from evaluator.config import (
-SENSITIVE_FILE_PATTERNS,
-LANGUAGE_EXTENSION_MAP,
+    SENSITIVE_FILE_PATTERNS,
+    LANGUAGE_EXTENSION_MAP,
 )
 
 
 class GitService:
     """
-    Handles Git operations required by the evaluator:
+    Handles Git operations required by the evaluator.
 
-    - Resolve branches/tags/commit IDs to immutable commit SHAs
-    - Find changed files between base and target revisions
-    - Find added/deleted line ranges
-    - Read files directly from a specific Git revision
-    - List files available at a specific revision
+    Responsibilities:
     - Detect repository URLs
-    - Clone repositories
+    - Clone remote repositories
+    - Resolve branches/tags/SHAs to immutable commit SHAs
+    - Compare base and target revisions
+    - Handle same base/target revision by evaluating latest commit
+    - Handle repository initial commit
+    - Detect changed files and change types
+    - Detect actual added/deleted line ranges
+    - Read files directly from a Git revision
+    - List files from a single revision
 
-    Evaluation should not depend on the currently checked-out branch.
+    Evaluation does not depend on the currently checked-out branch.
     """
 
     STATUS_MAP = {
@@ -35,7 +39,9 @@ class GitService:
     }
 
     def __init__(self, repository_path: str):
-        self.repository_path = Path(repository_path).resolve()
+        self.repository_path = Path(
+            repository_path
+        ).resolve()
 
         if not self.repository_path.exists():
             raise FileNotFoundError(
@@ -49,22 +55,17 @@ class GitService:
                 f"{self.repository_path}"
             )
 
-    # ── Repository preparation ──────────────────────────────
+    # ────────────────────────────────────────────────────────
+    # Repository preparation
+    # ────────────────────────────────────────────────────────
 
     @staticmethod
-    def is_repository_url(value: str) -> bool:
+    def is_repository_url(
+        value: str,
+    ) -> bool:
         """
         Determine whether the supplied value looks like
         a Git repository URL.
-
-        Supported examples:
-
-            https://github.com/user/repository.git
-            http://server/repository.git
-            git://server/repository.git
-            ssh://server/repository.git
-
-        Local paths return False.
         """
 
         if not value:
@@ -90,10 +91,7 @@ class GitService:
         destination: str,
     ) -> str:
         """
-        Clone a Git repository into the supplied destination.
-
-        Normally the destination will be inside a
-        TemporaryDirectory created by evaluation_service.py.
+        Clone a remote Git repository into destination.
         """
 
         if not repository_url:
@@ -105,10 +103,13 @@ class GitService:
             repository_url
         ):
             raise ValueError(
-                f"Invalid repository URL: {repository_url}"
+                f"Invalid repository URL: "
+                f"{repository_url}"
             )
 
-        destination_path = Path(destination)
+        destination_path = Path(
+            destination
+        )
 
         command = [
             "git",
@@ -129,7 +130,8 @@ class GitService:
         except FileNotFoundError as exc:
             raise RuntimeError(
                 "Git executable not found. "
-                "Make sure Git is installed and available in PATH."
+                "Make sure Git is installed "
+                "and available in PATH."
             ) from exc
 
         except subprocess.CalledProcessError as exc:
@@ -148,27 +150,33 @@ class GitService:
             destination_path.resolve()
         )
 
-    # ── Public API ──────────────────────────────────────────
+    # ────────────────────────────────────────────────────────
+    # Public API
+    # ────────────────────────────────────────────────────────
 
     def get_files_at_revision(
-    self,
-    revision: str,
-) -> List[str]:
+        self,
+        revision: str,
+    ) -> List[str]:
         """
-        `Return supported, non-sensitive source files
-    that exist in the supplied Git revision.
-    """
+        Return supported, non-sensitive source files
+        available in the supplied Git revision.
+
+        Used when:
+        - target_commit is empty
+        - repository contains only an initial commit
+        """
 
         revision_sha = self._resolve_commit(
-        revision
-    )
+            revision
+        )
 
         output = self._run_git([
-        "ls-tree",
-        "-r",
-        "--name-only",
-        revision_sha,
-    ])
+            "ls-tree",
+            "-r",
+            "--name-only",
+            revision_sha,
+        ])
 
         if not output:
             return []
@@ -176,21 +184,34 @@ class GitService:
         files = []
 
         for file_path in output.splitlines():
+
             file_path = file_path.strip()
 
             if not file_path:
                 continue
 
-            if self._is_sensitive(file_path):
+            if self._is_sensitive(
+                file_path
+            ):
                 continue
 
-        # Only send file types supported by the parser.
-            extension = Path(file_path).suffix.lower()
+            extension = (
+                Path(file_path)
+                .suffix
+                .lower()
+            )
 
-            if extension not in LANGUAGE_EXTENSION_MAP:
+            # Only source formats supported by
+            # parser_service are evaluated.
+            if (
+                extension
+                not in LANGUAGE_EXTENSION_MAP
+            ):
                 continue
 
-            files.append(file_path)
+            files.append(
+                file_path
+            )
 
         return files
 
@@ -201,21 +222,54 @@ class GitService:
         branch: Optional[str] = None,
     ) -> dict:
         """
-        Return changed files between two Git revisions
-        together with added/deleted line ranges.
+        Return evaluation changes between base and target.
 
-        branch is retained for backward compatibility,
-        but it is intentionally NOT checked out.
+        Normal case
+        -----------
+        base != target
 
-        base_commit and target_commit may be:
+            base
+              ↓
+            target
 
-        - local branch names
-        - remote branch names
-        - tags
-        - short SHAs
-        - full SHAs
+        The normal Git diff is evaluated.
+
+        Same revision case
+        ------------------
+        Example:
+
+            base_commit   = "main"
+            target_commit = "main"
+
+        If both resolve to:
+
+            C1 -> C2 -> C3
+                        ↑
+                       main
+
+        then evaluation becomes:
+
+            base   = C2
+            target = C3
+
+        Therefore only the latest commit is evaluated.
+
+        Initial commit case
+        -------------------
+        If repository history is:
+
+            C1
+            ↑
+           main
+
+        C1 has no parent. Every supported source file
+        in C1 is therefore treated as newly added.
+
+        branch is retained for API compatibility but
+        is intentionally not checked out.
         """
 
+        # Resolve both supplied values first.
         base_sha = self._resolve_commit(
             base_commit
         )
@@ -223,6 +277,93 @@ class GitService:
         target_sha = self._resolve_commit(
             target_commit
         )
+
+        # ────────────────────────────────────────────────────
+        # SAME REVISION
+        # ────────────────────────────────────────────────────
+        #
+        # This works not only for:
+        #
+        #   main / main
+        #
+        # but also:
+        #
+        #   main / origin/main
+        #
+        # if they resolve to the same SHA.
+        #
+        if base_sha == target_sha:
+
+            latest_sha = target_sha
+
+            parent_sha = self._get_parent_commit(
+                latest_sha
+            )
+
+            # ── Initial commit ───────────────────────────────
+            #
+            # No previous commit exists.
+            #
+            # Treat all supported files in the initial commit
+            # as newly added.
+            #
+            if parent_sha is None:
+
+                files = self.get_files_at_revision(
+                    latest_sha
+                )
+
+                changes = [
+                    {
+                        "change_type": "added",
+                        "old_path": None,
+                        "new_path": file_path,
+                        "added_lines": [],
+                        "deleted_lines": [],
+                    }
+                    for file_path in files
+                ]
+
+                return {
+                    # There is no true parent/base commit.
+                    #
+                    # Keeping base and target equal allows
+                    # evaluation_service to continue using
+                    # target_sha to read complete files.
+                    "base_commit": latest_sha,
+                    "target_commit": latest_sha,
+                    "changed_file_count": len(
+                        changes
+                    ),
+                    "changes": changes,
+                    "evaluation_mode":
+                        "initial_commit",
+                }
+
+            # ── Latest commit evaluation ─────────────────────
+            #
+            # C1 -> C2 -> C3
+            #
+            # base   = C2
+            # target = C3
+            #
+            base_sha = parent_sha
+            target_sha = latest_sha
+
+            evaluation_mode = (
+                "latest_commit"
+            )
+
+        else:
+
+            # Normal explicitly supplied base → target.
+            evaluation_mode = (
+                "base_to_target"
+            )
+
+        # ────────────────────────────────────────────────────
+        # Git diff
+        # ────────────────────────────────────────────────────
 
         name_status = self._run_git([
             "diff",
@@ -240,6 +381,7 @@ class GitService:
         filtered_changes = []
 
         for change in changes:
+
             file_path = (
                 change.get("new_path")
                 or change.get("old_path")
@@ -248,23 +390,43 @@ class GitService:
             if not file_path:
                 continue
 
+            # Ignore configured sensitive/binary files.
             if self._is_sensitive(
                 file_path
             ):
                 continue
 
-            line_changes = self._get_line_changes(
-                base_sha,
-                target_sha,
-                change,
+            extension = (
+                Path(file_path)
+                .suffix
+                .lower()
+            )
+
+            # Only evaluate parser-supported source files.
+            if (
+                extension
+                not in LANGUAGE_EXTENSION_MAP
+            ):
+                continue
+
+            line_changes = (
+                self._get_line_changes(
+                    base_sha,
+                    target_sha,
+                    change,
+                )
             )
 
             change["added_lines"] = (
-                line_changes["added_lines"]
+                line_changes[
+                    "added_lines"
+                ]
             )
 
             change["deleted_lines"] = (
-                line_changes["deleted_lines"]
+                line_changes[
+                    "deleted_lines"
+                ]
             )
 
             filtered_changes.append(
@@ -278,6 +440,8 @@ class GitService:
                 filtered_changes
             ),
             "changes": filtered_changes,
+            "evaluation_mode":
+                evaluation_mode,
         }
 
     def read_file_content(
@@ -287,9 +451,10 @@ class GitService:
         """
         Read a file from the current working tree.
 
-        Retained temporarily for backward compatibility.
+        Retained for backward compatibility.
 
-        Evaluation should prefer read_file_at_revision().
+        Evaluation should normally use
+        read_file_at_revision().
         """
 
         full_path = (
@@ -315,13 +480,12 @@ class GitService:
         relative_path: str,
     ) -> Optional[str]:
         """
-        Read a file exactly as it exists at a Git revision.
+        Read a file exactly as it exists at
+        a specific Git revision.
 
-        Equivalent command:
+        Equivalent to:
 
-            git show <revision_sha>:<relative_path>
-
-        This does not depend on the currently checked-out branch.
+            git show <sha>:<path>
         """
 
         if not revision_sha:
@@ -342,13 +506,18 @@ class GitService:
         try:
             return self._run_git([
                 "show",
-                f"{revision_sha}:{normalized_path}",
+                (
+                    f"{revision_sha}:"
+                    f"{normalized_path}"
+                ),
             ])
 
         except RuntimeError:
             return None
 
-    # ── Git commands ────────────────────────────────────────
+    # ────────────────────────────────────────────────────────
+    # Git commands
+    # ────────────────────────────────────────────────────────
 
     def _run_git(
         self,
@@ -378,10 +547,12 @@ class GitService:
         except FileNotFoundError as exc:
             raise RuntimeError(
                 "Git executable not found. "
-                "Make sure Git is installed and available in PATH."
+                "Make sure Git is installed "
+                "and available in PATH."
             ) from exc
 
         except subprocess.CalledProcessError as exc:
+
             error_message = (
                 exc.stderr.strip()
                 if exc.stderr
@@ -398,7 +569,7 @@ class GitService:
         self,
     ) -> bool:
         """
-        Check whether repository_path points to
+        Check whether repository_path is
         a valid Git working tree.
         """
 
@@ -426,7 +597,8 @@ class GitService:
         except FileNotFoundError as exc:
             raise RuntimeError(
                 "Git executable not found. "
-                "Make sure Git is installed and available in PATH."
+                "Make sure Git is installed "
+                "and available in PATH."
             ) from exc
 
     def _resolve_commit(
@@ -434,11 +606,17 @@ class GitService:
         revision: str,
     ) -> str:
         """
-        Resolve a local branch, remote branch, tag,
-        short SHA, or full SHA to an immutable commit SHA.
+        Resolve a local branch, remote branch,
+        tag, short SHA, or full SHA.
 
-        If a plain branch such as 'deva' is not available
-        locally, try the corresponding 'origin/deva' ref.
+        First tries exactly what was supplied.
+
+        Example:
+            main
+
+        If that fails, tries:
+
+            origin/main
         """
 
         if not revision:
@@ -448,7 +626,7 @@ class GitService:
 
         revision = revision.strip()
 
-        # First try exactly what the user supplied.
+        # First try exactly what was supplied.
         try:
             return self._run_git([
                 "rev-parse",
@@ -456,8 +634,9 @@ class GitService:
             ])
 
         except RuntimeError as first_error:
-            # If origin/... was already supplied,
-            # do not prepend origin again.
+
+            # If caller already supplied origin/...,
+            # don't create origin/origin/...
             if revision.startswith(
                 "origin/"
             ):
@@ -467,11 +646,13 @@ class GitService:
                 f"origin/{revision}"
             )
 
-            # Try the remote-tracking branch.
             try:
                 return self._run_git([
                     "rev-parse",
-                    f"{remote_revision}^{{commit}}",
+                    (
+                        f"{remote_revision}"
+                        f"^{{commit}}"
+                    ),
                 ])
 
             except RuntimeError:
@@ -481,14 +662,77 @@ class GitService:
                     f"'{remote_revision}'."
                 ) from first_error
 
-    # ── Diff parsing ────────────────────────────────────────
+    def _get_parent_commit(
+        self,
+        commit_sha: str,
+    ) -> Optional[str]:
+        """
+        Return the first parent of a commit.
+
+        Example:
+
+            C1 -> C2 -> C3
+
+        For C3:
+            returns C2
+
+        For the repository's initial commit:
+            returns None
+
+        For a merge commit, the first parent is used.
+        This represents the branch state immediately
+        before the merge commit.
+        """
+
+        if not commit_sha:
+            raise ValueError(
+                "Commit SHA cannot be empty."
+            )
+
+        # Example output:
+        #
+        # Normal commit:
+        #   C3 C2
+        #
+        # Merge commit:
+        #   C3 C2 OTHER_PARENT
+        #
+        # Initial commit:
+        #   C1
+        #
+        output = self._run_git([
+            "rev-list",
+            "--parents",
+            "-n",
+            "1",
+            commit_sha,
+        ])
+
+        if not output:
+            return None
+
+        parts = output.split()
+
+        # Only the commit SHA itself means this
+        # is the root/initial commit.
+        if len(parts) < 2:
+            return None
+
+        # First parent.
+        return parts[1]
+
+    # ────────────────────────────────────────────────────────
+    # Diff parsing
+    # ────────────────────────────────────────────────────────
 
     def _parse_name_status(
         self,
         diff_output: str,
     ) -> List[dict]:
         """
-        Parse git diff --name-status output.
+        Parse output from:
+
+            git diff --name-status
         """
 
         changes = []
@@ -497,10 +741,22 @@ class GitService:
             return changes
 
         for line in diff_output.splitlines():
-            parts = line.split("\t")
+
+            parts = line.split(
+                "\t"
+            )
+
+            if len(parts) < 2:
+                continue
 
             raw_status = parts[0]
-            status_code = raw_status[0]
+
+            if not raw_status:
+                continue
+
+            status_code = (
+                raw_status[0]
+            )
 
             change_type = (
                 self.STATUS_MAP.get(
@@ -509,10 +765,15 @@ class GitService:
                 )
             )
 
+            # Rename or copy.
             if status_code in {
                 "R",
                 "C",
             }:
+
+                if len(parts) < 3:
+                    continue
+
                 old_path = parts[1]
                 new_path = parts[2]
 
@@ -539,17 +800,21 @@ class GitService:
                 })
 
             else:
+
                 file_path = parts[1]
 
                 if status_code == "D":
+
                     old_path = file_path
                     new_path = None
 
                 elif status_code == "A":
+
                     old_path = None
                     new_path = file_path
 
                 else:
+
                     old_path = file_path
                     new_path = file_path
 
@@ -571,13 +836,25 @@ class GitService:
         change: dict,
     ) -> dict:
         """
-        Get added and deleted line ranges for a changed file.
+        Return actual added/deleted line ranges.
+
+        This walks the diff body and records only
+        lines prefixed with '+' or '-'.
+
+        It does not consider the entire Git hunk
+        to be modified code.
         """
 
         file_path = (
             change.get("new_path")
             or change.get("old_path")
         )
+
+        if not file_path:
+            return {
+                "added_lines": [],
+                "deleted_lines": [],
+            }
 
         diff_output = self._run_git([
             "diff",
@@ -588,53 +865,151 @@ class GitService:
             file_path,
         ])
 
-        added_lines = []
-        deleted_lines = []
+        added_line_numbers = []
+        deleted_line_numbers = []
+
+        old_line = None
+        new_line = None
 
         for line in diff_output.splitlines():
-            if not line.startswith("@@"):
+
+            # Start of a Git diff hunk.
+            if line.startswith("@@"):
+
+                (
+                    old_start,
+                    _old_count,
+                    new_start,
+                    _new_count,
+                ) = self._parse_hunk_header(
+                    line
+                )
+
+                old_line = old_start
+                new_line = new_start
+
                 continue
 
-            (
-                old_start,
-                old_count,
-                new_start,
-                new_count,
-            ) = self._parse_hunk_header(
-                line
-            )
+            # Ignore diff file-header lines.
+            if (
+                line.startswith("---")
+                or line.startswith("+++")
+            ):
+                continue
 
-            if old_count > 0:
-                deleted_lines.append([
-                    old_start,
-                    old_start
-                    + old_count
-                    - 1,
-                ])
+            # Ignore everything before a valid hunk.
+            if (
+                old_line is None
+                or new_line is None
+            ):
+                continue
 
-            if new_count > 0:
-                added_lines.append([
-                    new_start,
-                    new_start
-                    + new_count
-                    - 1,
-                ])
+            # Added line exists in target.
+            if line.startswith("+"):
+
+                added_line_numbers.append(
+                    new_line
+                )
+
+                new_line += 1
+
+            # Deleted line existed in base.
+            elif line.startswith("-"):
+
+                deleted_line_numbers.append(
+                    old_line
+                )
+
+                old_line += 1
+
+            # Context line exists in both.
+            else:
+
+                old_line += 1
+                new_line += 1
 
         return {
             "added_lines":
-                added_lines,
+                self._group_line_numbers(
+                    added_line_numbers
+                ),
             "deleted_lines":
-                deleted_lines,
+                self._group_line_numbers(
+                    deleted_line_numbers
+                ),
         }
+
+    def _group_line_numbers(
+        self,
+        line_numbers: List[int],
+    ) -> List[list]:
+        """
+        Convert individual line numbers into
+        contiguous ranges.
+
+        Example:
+
+            [4, 5, 6, 10, 11]
+
+        becomes:
+
+            [
+                [4, 6],
+                [10, 11]
+            ]
+        """
+
+        if not line_numbers:
+            return []
+
+        ranges = []
+
+        start = line_numbers[0]
+        previous = line_numbers[0]
+
+        for line_number in (
+            line_numbers[1:]
+        ):
+
+            if (
+                line_number
+                == previous + 1
+            ):
+                previous = line_number
+                continue
+
+            ranges.append([
+                start,
+                previous,
+            ])
+
+            start = line_number
+            previous = line_number
+
+        ranges.append([
+            start,
+            previous,
+        ])
+
+        return ranges
 
     def _parse_hunk_header(
         self,
         header: str,
     ):
         """
-        Parse a Git diff hunk header such as:
+        Parse a Git diff hunk header.
 
-            @@ -10,2 +10,4 @@
+        Example:
+
+            @@ -27,7 +34,32 @@
+
+        Returns:
+
+            old_start
+            old_count
+            new_start
+            new_count
         """
 
         hunk = (
@@ -672,20 +1047,25 @@ class GitService:
         value: str,
     ):
         """
-        Parse a Git diff range such as:
+        Parse Git diff ranges such as:
 
-            -10,3
-            +12,5
-            +18
+            -27,7
+            +34,32
+            +10
+            -0,0
         """
 
         value = value[1:]
 
         if "," in value:
-            start, count = (
-                value.split(",")
+
+            start, count = value.split(
+                ",",
+                1,
             )
+
         else:
+
             start = value
             count = 1
 
@@ -694,15 +1074,17 @@ class GitService:
             int(count),
         )
 
-    # ── Filtering ───────────────────────────────────────────
+    # ────────────────────────────────────────────────────────
+    # Filtering
+    # ────────────────────────────────────────────────────────
 
     def _is_sensitive(
         self,
         file_path: str,
     ) -> bool:
         """
-        Return True if the path matches any configured
-        sensitive-file pattern.
+        Check whether a path matches one of
+        the configured sensitive-file patterns.
         """
 
         return any(
