@@ -22,8 +22,6 @@ class EvaluationResponseSerializer(serializers.Serializer):
     score = serializers.IntegerField()
     status = serializers.CharField()
     summary = serializers.CharField()
-    issues = serializers.ListField(child=serializers.CharField())
-    strengths = serializers.ListField(child=serializers.CharField())
     rubric = serializers.DictField()
 
 
@@ -32,3 +30,4 @@ class ScoringMetricSerializer(serializers.Serializer):
 
     name = serializers.CharField(max_length=100)
     display_name = serializers.CharField(max_length=100)
+    description = serializers.CharField(max_length=255, required=False, default="")

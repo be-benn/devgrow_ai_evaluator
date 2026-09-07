@@ -26,24 +26,37 @@ from collections import namedtuple
 logger = logging.getLogger(__name__)
 
 
-_MetricDef = namedtuple("_MetricDef", ["name", "display_name"])
+_MetricDef = namedtuple("_MetricDef", ["name", "display_name", "description"])
 
 DEFAULT_METRICS = [
-    _MetricDef("requirement_coverage", "Requirement Coverage"),
-    _MetricDef("correctness", "Code Correctness"),
+    _MetricDef(
+        "requirement_coverage",
+        "Requirement Coverage",
+        "Percentage of acceptance criteria addressed by the code. "
+        "Score based on how many criteria have a visible implementation.",
+    ),
+    _MetricDef(
+        "correctness",
+        "Code Correctness",
+        "Whether the implemented logic is correct, free of bugs, and handles "
+        "edge cases. Deduct for logic errors, crashes, or wrong outputs.",
+    ),
 ]
 
 
 def _zero_rubric(metrics):
     """Build a zero-score rubric dict from active metrics."""
-    return {m.name: 0 for m in metrics}
+    return {
+        m.name: {"score": 0, "strengths": [], "issues": []}
+        for m in metrics
+    }
 
 
 def _get_metrics():
     """Return hardcoded defaults + any extra metrics from DB (max 5 total)."""
     extras = ScoringMetric.get_extra_metrics()
     extra_defs = [
-        _MetricDef(m.name, m.display_name)
+        _MetricDef(m.name, m.display_name, m.description)
         for m in extras
     ]
     return DEFAULT_METRICS + extra_defs
@@ -96,8 +109,6 @@ def evaluate(request: EvaluationRequest) -> EvaluationResponse:
             score=cached.score,
             status=cached.status,
             summary=cached.summary,
-            issues=cached.issues,
-            strengths=cached.strengths,
             rubric=cached.rubric,
         )
 
@@ -139,10 +150,6 @@ def evaluate(request: EvaluationRequest) -> EvaluationResponse:
                 score=0,
                 status="Not Met",
                 summary=f"Repository preparation failed: {e}",
-                issues=[
-                    f"Repository error: {e}"
-                ],
-                strengths=[],
                 rubric=_zero_rubric(_get_metrics()),
             )
 
@@ -185,10 +192,6 @@ def _run_evaluation(
             score=0,
             status="Not Met",
             summary="No acceptance criteria provided.",
-            issues=[
-                "No acceptance criteria to evaluate against."
-            ],
-            strengths=[],
             rubric=_zero_rubric(metrics),
         )
 
@@ -248,8 +251,6 @@ def _run_evaluation(
                         "No supported code changes found "
                         "between the selected revisions."
                     ),
-                    issues=[],
-                    strengths=[],
                     rubric=_zero_rubric(metrics),
                 )
 
@@ -295,8 +296,6 @@ def _run_evaluation(
                         "No supported source files found "
                         "in the supplied base branch."
                     ),
-                    issues=[],
-                    strengths=[],
                     rubric=_zero_rubric(metrics),
                 )
 
@@ -310,10 +309,6 @@ def _run_evaluation(
             score=0,
             status="Not Met",
             summary=f"Git analysis failed: {e}",
-            issues=[
-                f"Git error: {e}"
-            ],
-            strengths=[],
             rubric=_zero_rubric(metrics),
         )
 
@@ -403,11 +398,6 @@ def _run_evaluation(
             score=0,
             status="Not Met",
             summary="No parseable code changes found.",
-            issues=[
-                "Selected files could not be parsed "
-                "or contained no supported code."
-            ],
-            strengths=[],
             rubric=_zero_rubric(metrics),
         )
 
@@ -428,10 +418,6 @@ def _run_evaluation(
             score=0,
             status="Not Met",
             summary="No evaluable code chunks were generated.",
-            issues=[
-                "Selected source files produced no evaluable chunks."
-            ],
-            strengths=[],
             rubric=_zero_rubric(metrics),
         )
 
@@ -504,8 +490,16 @@ def _run_evaluation(
         len(unique_strengths),
     )
 
+    # ── Step 6b: Group findings by metric tag ───────────────
+    grouped_strengths = _group_findings_by_metric(
+        unique_strengths, metrics
+    )
+    grouped_issues = _group_findings_by_metric(
+        unique_issues, metrics
+    )
+
     # ── Step 7: Final LLM scoring ───────────────────────────
-    rubric = _final_scoring(
+    rubric_score = _final_scoring(
         project_title=request.project_title,
         project_description=request.project_description,
         task_title=request.task_title,
@@ -517,12 +511,19 @@ def _run_evaluation(
         metrics=metrics,
     )
 
-    # ── Step 8: Functional score ────────────────────────────
-    # Each metric is scored 0–100.
-    # Final score = sum(scores) / (num_metrics * 100) * 100
-    #
+    # ── Step 8: Build nested rubric + compute final score ───
+    result_rubric = {}
+    for m in metrics:
+        result_rubric[m.name] = {
+            "score": rubric_score.scores.get(m.name, 0),
+            "strengths": grouped_strengths.get(m.name, []),
+            "issues": grouped_issues.get(m.name, []),
+        }
+
     metric_count = len(metrics)
-    total = sum(rubric.scores.values())
+    total = sum(
+        rubric_score.scores.get(m.name, 0) for m in metrics
+    )
     max_possible = metric_count * 100
 
     final_score = round(
@@ -533,17 +534,11 @@ def _run_evaluation(
         "Step 8: Final score = %d (%d metrics), status = %s.",
         final_score,
         metric_count,
-        rubric.criteria_status,
+        rubric_score.criteria_status,
     )
 
-    # ── Step 9: Response ────────────────────────────────────
-    result_rubric = rubric.scores
-
-    result_issues = unique_issues
-    result_strengths = unique_strengths[:5]
-
-    # ── Persist to DB (only on successful evaluation) ──────
-    is_successful = not rubric.summary.startswith("Final scoring failed:")
+    # ── Step 9: Persist + respond ───────────────────────────
+    is_successful = not rubric_score.summary.startswith("Final scoring failed:")
     if is_successful:
         try:
             EvaluationResult.objects.update_or_create(
@@ -553,10 +548,8 @@ def _run_evaluation(
                 task_title=request.task_title,
                 defaults={
                     "score": final_score,
-                    "status": rubric.criteria_status,
-                    "summary": rubric.summary,
-                    "issues": result_issues,
-                    "strengths": result_strengths,
+                    "status": rubric_score.criteria_status,
+                    "summary": rubric_score.summary,
                     "rubric": result_rubric,
                 },
             )
@@ -568,14 +561,41 @@ def _run_evaluation(
 
     return EvaluationResponse(
         score=final_score,
-        status=rubric.criteria_status,
-        summary=rubric.summary,
-        issues=result_issues,
-        strengths=result_strengths,
+        status=rubric_score.criteria_status,
+        summary=rubric_score.summary,
         rubric=result_rubric,
 )
 
 # ── Private helpers ─────────────────────────────────────────
+
+
+def _group_findings_by_metric(findings, metrics):
+    """
+    Group tagged findings into per-metric buckets.
+
+    Each finding is expected to start with a tag like
+    '[Requirement Coverage] ...' — the tag is matched to a metric's
+    display_name and the prefix is stripped from the stored string.
+    Untagged findings are skipped.
+    """
+    tag_to_name = {
+        m.display_name.lower(): m.name for m in metrics
+    }
+    grouped = {m.name: [] for m in metrics}
+
+    for item in findings:
+        if not isinstance(item, str) or not item.startswith("["):
+            continue
+        bracket_end = item.find("]")
+        if bracket_end == -1:
+            continue
+        tag = item[1:bracket_end].strip().lower()
+        text = item[bracket_end + 1:].strip()
+        metric_name = tag_to_name.get(tag)
+        if metric_name and text:
+            grouped[metric_name].append(text)
+
+    return grouped
 
 
 def _evaluate_chunk(
@@ -694,9 +714,16 @@ def _final_scoring(
     metric_names = [m.name for m in (metrics or [])]
 
     rubric_lines = "\n".join(
-        f"- {name} : 0\u2013100"
-        for name in metric_names
-    ) or "- requirement_coverage : 0\u2013100\n- correctness : 0\u2013100"
+        f"- {m.name} (0\u2013100): {m.description}"
+        for m in (metrics or [])
+    ) or (
+        "- requirement_coverage (0\u2013100): Percentage of acceptance criteria addressed.\n"
+        "- correctness (0\u2013100): Whether the logic is correct and bug-free."
+    )
+
+    metric_tags = ", ".join(
+        f"[{m.display_name}]" for m in (metrics or [])
+    )
 
     output_fields = "\n".join(
         f"- {name}: integer from 0 to 100"
@@ -720,12 +747,21 @@ You are a Code Evaluation Judge. Score the submitted code using a FIXED rubric.
 {criteria_text}
 
 **CONSOLIDATED FINDINGS:**
+Each finding is prefixed with a metric tag (e.g. {metric_tags}).
+Use these tags to attribute each finding to the correct metric.
+
 Issues   : {unique_issues}
 Strengths: {unique_strengths}
 Evidence : {unique_evidence}
 
-**SCORING RUBRIC \u2014 assign points within each stated range:**
+**SCORING RUBRIC \u2014 each metric measures something DIFFERENT. Score them independently:**
 {rubric_lines}
+
+**SCORING PROCESS (follow this step by step):**
+1. Group the findings above by their metric tag (e.g. all [Requirement Coverage] findings together).
+2. For EACH metric, consider ONLY the findings tagged for that metric.
+3. Score each metric independently based on its own description and its own findings.
+4. Different metrics MUST receive different scores unless the evidence genuinely justifies identical scores.
 
 **SCORING GUIDELINES:**
 - If a criterion is partially implemented, give proportional credit (e.g. 50\u201370
@@ -736,8 +772,6 @@ Evidence : {unique_evidence}
   even if the implementation is not identical to the ideal approach.
 - Reserve very low scores (below 20) only for submissions where the criterion
   is truly absent or fundamentally broken.
-- If more strengths than issues are reported, scores should lean toward the
-  higher end of the range.
 
 **RULES:**
 - Base scores ONLY on the consolidated findings above.

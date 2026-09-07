@@ -103,11 +103,21 @@ def update_scoring_metrics(request):
 
     # Build full response: defaults + extras
     defaults = [
-        {"name": "requirement_coverage", "display_name": "Requirement Coverage"},
-        {"name": "correctness", "display_name": "Code Correctness"},
+        {
+            "name": "requirement_coverage",
+            "display_name": "Requirement Coverage",
+            "description": "Percentage of acceptance criteria addressed by the code. "
+                           "Score based on how many criteria have a visible implementation.",
+        },
+        {
+            "name": "correctness",
+            "display_name": "Code Correctness",
+            "description": "Whether the implemented logic is correct, free of bugs, and handles "
+                           "edge cases. Deduct for logic errors, crashes, or wrong outputs.",
+        },
     ]
     extras = [
-        {"name": m.name, "display_name": m.display_name}
+        {"name": m.name, "display_name": m.display_name, "description": m.description}
         for m in ScoringMetric.get_extra_metrics()
     ]
 

@@ -35,10 +35,11 @@ DevGrow AI Evaluator transitions code evaluation from naive diff inspection into
          │ 2. Git Diff Analysis & Sensitive File Filtering        │
          │ 3. Tree-sitter AST Parsing & Context Extraction        │
          │ 4. Structure-Aware Code Chunking                       │
-         │ 5. Chunk-level LLM Evaluation (Observable Facts)       │
-         │ 6. Findings Consolidation & Deduplication              │
+         │ 5. Chunk-level LLM Evaluation (Tagged Findings)        │
+         │ 6. Findings Consolidation, Deduplication & Grouping    │
          │ 7. Final Rubric Scoring LLM Pass                       │
-         │ 8. Deterministic Score Aggregation & Response          │
+         │ 8. Nested Rubric Assembly & Score Aggregation          │
+         │ 9. Persist & Respond                                   │
          └───────────────────────────┬────────────────────────────┘
                                      │
                                      ▼
@@ -73,20 +74,28 @@ DevGrow AI Evaluator transitions code evaluation from naive diff inspection into
 
 ### Step 5: Per-Chunk LLM Analysis
 - Each chunk is reviewed independently by the LLM using a strict system prompt.
-- The LLM acts as a Senior Code Reviewer, identifying visible **strengths**, **issues** (logic bugs, syntax errors, missing criteria), and **evidence** (code quotes).
+- The LLM acts as a Senior Code Reviewer, identifying **strengths**, **issues**, and **evidence** (code quotes).
+- Every strength and issue is **tagged** with a metric label (e.g. `[Requirement Coverage]`, `[Code Correctness]`) so findings can be attributed to the correct scoring dimension.
 - No scores are assigned at this stage, preventing partial-view score skew.
 
-### Step 6: Deduplication & Consolidation
+### Step 6: Deduplication, Consolidation & Grouping
 - `_deduplicate()` consolidates chunk findings across all chunks using keyword set intersection to remove redundant issues and strengths.
+- `_group_findings_by_metric()` routes each tagged finding into per-metric buckets and strips the tag prefix from the stored string.
 
 ### Step 7: Final Rubric Scoring
 - `_final_scoring()` sends the consolidated findings, project context, and acceptance criteria to the LLM.
-- The LLM scores the code across 2 structured dimensions.
+- The prompt includes **descriptions** for each metric so the LLM understands what each dimension measures.
+- The LLM is instructed to **group findings by their metric tag** and score each metric independently based on its own subset of findings.
+- The LLM scores the code across all active metrics (2 defaults + up to 3 custom).
 
-### Step 8: Deterministic Score Computation
-- The system sums the 2 rubric dimensions in code and normalizes to a 100-point scale:
-  $$\text{Final Score} = \text{round}\left(\frac{\text{Requirement Coverage} + \text{Correctness}}{65} \times 100\right)$$
-- Returns the complete result conforming to the evaluation contract.
+### Step 8: Nested Rubric Assembly & Score Aggregation
+- For each metric, the system assembles a nested rubric entry containing the LLM score and the grouped strengths/issues for that metric.
+- The final score is computed deterministically:
+  $$\text{Final Score} = \text{round}\left(\frac{\sum \text{metric scores}}{\text{metric count} \times 100} \times 100\right)$$
+
+### Step 9: Persist & Respond
+- Successful evaluations are cached in the database (keyed by repository + commits + task title).
+- Returns the complete result with nested rubric.
 
 ---
 
@@ -104,9 +113,10 @@ d:/devgrow_ai_evaluator/
 ├── evaluator/                     # Evaluator Django App
 │   ├── __init__.py
 │   ├── config.py                  # Environment variable loader & constants
+│   ├── models.py                  # Django models (EvaluationResult, ScoringMetric)
 │   ├── schemas.py                 # Pydantic models for request/response/LLM data
 │   ├── serializers.py             # Django REST Framework serializers
-│   ├── urls.py                    # App URL router (/api/evaluate/)
+│   ├── urls.py                    # App URL router (/api/evaluate/, /api/scoring-metrics/)
 │   ├── views.py                   # API view controllers
 │   └── services/                  # Business logic & domain services
 │       ├── __init__.py
@@ -115,6 +125,7 @@ d:/devgrow_ai_evaluator/
 │       ├── evaluation_service.py  # Central orchestration pipeline
 │       ├── git_service.py         # Subprocess Git interface & diff analyzer
 │       ├── llm_service.py         # LangChain Ollama caller, Langfuse & retries
+│       ├── metrics_service.py     # Aggregated performance metrics & statistics
 │       └── parser_service.py      # Tree-sitter AST & regex code extractor
 │
 ├── .env.example                   # Example environment configuration
@@ -128,32 +139,46 @@ d:/devgrow_ai_evaluator/
 | :--- | :--- |
 | `devgrow_ai_evaluator/settings.py` | Configures Django apps, middleware, databases, and DRF settings. |
 | `evaluator/config.py` | Loads `.env` file; defines LLM parameters, Langfuse keys, chunk sizes, and sensitive file regexes. |
+| `evaluator/models.py` | Defines `EvaluationResult` (cached evaluation) and `ScoringMetric` (custom metrics with descriptions). |
 | `evaluator/schemas.py` | Defines Pydantic validation schemas: `EvaluationRequest`, `ParsedCodeFragment`, `ChunkEvaluationResult`, `RubricScore`, and `EvaluationResponse`. |
 | `evaluator/serializers.py` | Serializes and validates HTTP JSON payloads using Django REST Framework serializers. |
-| `evaluator/views.py` | Entry point `evaluate_code` handling `POST /api/evaluate/` requests with error handling. |
+| `evaluator/views.py` | Entry points: `evaluate_code` (`POST /api/evaluate/`) and `update_scoring_metrics` (`POST /api/scoring-metrics/`). |
 | `evaluator/services/acceptance_criteria.py` | Parses free-form user criteria strings into clean lists. |
 | `evaluator/services/git_service.py` | Runs Git commands to validate repositories, switch branches, resolve commits, and extract changed line ranges. |
 | `evaluator/services/parser_service.py` | Uses Tree-sitter parsers to extract AST nodes for changed lines across 20+ programming languages. |
 | `evaluator/services/chunker_service.py` | Packs fragments into size-limited chunks with file and class header annotations. |
 | `evaluator/services/llm_service.py` | Wraps LangChain `ChatOllama` with Tenacity exponential retry logic, Langfuse tracing, and JSON output parsing. |
-| `evaluator/services/evaluation_service.py` | Coordinates the end-to-end evaluation pipeline and executes the two-phase LLM analysis. |
+| `evaluator/services/evaluation_service.py` | Coordinates the end-to-end evaluation pipeline and executes the two-phase LLM analysis with per-metric findings grouping. |
 
 ---
 
 ## Scoring Rubric & Criteria
 
-The evaluation uses a **65-point fixed rubric**, normalized to a 100-point scale:
+The evaluation uses **dynamic scoring metrics**. Two metrics are always present (defaults), and up to 3 additional custom metrics can be configured via the API, for a maximum of 5 total.
 
-| Category | Points Range | Description |
-| :--- | :---: | :--- |
-| **Requirement Coverage** | `0 - 40` | Does the code implement all specified acceptance criteria? |
-| **Correctness** | `0 - 25` | Is the logic bug-free, robust, and correctly structured? |
-| **Total (raw)** | `0 - 65` | Sum of both categories, normalized to 0–100. |
+### Default Metrics
+
+| Metric | Description |
+| :--- | :--- |
+| **Requirement Coverage** | Percentage of acceptance criteria addressed by the code. Score based on how many criteria have a visible implementation. |
+| **Code Correctness** | Whether the implemented logic is correct, free of bugs, and handles edge cases. Deduct for logic errors, crashes, or wrong outputs. |
+
+### Custom Metrics (Examples)
+
+| Metric | Description |
+| :--- | :--- |
+| **Code Quality** | Readability, naming conventions, and structural organization. |
+| **Test Coverage** | Presence and quality of unit/integration tests. |
+| **Performance** | Efficiency of algorithms and resource usage. |
+
+Each metric is scored **0–100** independently. The final score is computed as:
+
+$$\text{Final Score} = \text{round}\left(\frac{\sum \text{metric scores}}{\text{metric count} \times 100} \times 100\right)$$
 
 ### Status Thresholds
-- **Met**: Requirement Coverage $\ge 30$ points
-- **Partially Met**: Requirement Coverage between $15$ and $29$ points
-- **Not Met**: Requirement Coverage $< 15$ points
+- **Met**: Requirement Coverage ≥ 30
+- **Partially Met**: Requirement Coverage between 15 and 29
+- **Not Met**: Requirement Coverage < 15
 
 ---
 
@@ -184,16 +209,26 @@ The evaluation uses a **65-point fixed rubric**, normalized to a 100-point scale
   "score": 88,
   "status": "Met",
   "summary": "Coupon validation and percentage discount logic correctly implemented with proper error handling.",
-  "issues": [
-    "Edge case: Zero percent discount coupon causes division by zero in price calculation formula."
-  ],
-  "strengths": [
-    "Clean validation helper implemented with timezone-aware datetime checks.",
-    "Comprehensive docstrings and type annotations provided on the coupon view."
-  ],
   "rubric": {
-    "requirement_coverage": 35,
-    "correctness": 22
+    "requirement_coverage": {
+      "score": 85,
+      "strengths": [
+        "Implements all three acceptance criteria: expiry validation, percentage discount, and invalid coupon error handling."
+      ],
+      "issues": [
+        "Edge case: expired coupon with future start date not explicitly handled."
+      ]
+    },
+    "correctness": {
+      "score": 90,
+      "strengths": [
+        "Clean validation helper implemented with timezone-aware datetime checks.",
+        "Comprehensive error responses with appropriate HTTP status codes."
+      ],
+      "issues": [
+        "Zero percent discount coupon causes division by zero in price calculation formula."
+      ]
+    }
   }
 }
 ```
@@ -201,6 +236,75 @@ The evaluation uses a **65-point fixed rubric**, normalized to a 100-point scale
 #### Error Responses
 - **400 Bad Request**: Invalid JSON or missing required fields.
 - **500 Internal Server Error**: Git failure, parser crash, or unreachable LLM backend.
+
+---
+
+### Update Scoring Metrics
+`POST /api/scoring-metrics/`
+
+Manages additional scoring metrics beyond the defaults (`requirement_coverage` and `correctness` are always present). Maximum **3 additional metrics** accepted (5 total with defaults).
+
+#### Request Payload
+```json
+{
+  "metrics": [
+    {
+      "name": "code_quality",
+      "display_name": "Code Quality",
+      "description": "Readability, naming conventions, and structural organization. Deduct for deeply nested logic or unclear variable names."
+    },
+    {
+      "name": "test_coverage",
+      "display_name": "Test Coverage",
+      "description": "Presence and quality of unit and integration tests. Score based on whether critical paths are tested."
+    },
+    {
+      "name": "performance",
+      "display_name": "Performance",
+      "description": "Efficiency of algorithms and resource usage. Deduct for unnecessary loops, redundant queries, or memory leaks."
+    }
+  ]
+}
+```
+
+#### Successful Response (`200 OK`)
+```json
+{
+  "metrics": [
+    {
+      "name": "requirement_coverage",
+      "display_name": "Requirement Coverage",
+      "description": "Percentage of acceptance criteria addressed by the code. Score based on how many criteria have a visible implementation."
+    },
+    {
+      "name": "correctness",
+      "display_name": "Code Correctness",
+      "description": "Whether the implemented logic is correct, free of bugs, and handles edge cases. Deduct for logic errors, crashes, or wrong outputs."
+    },
+    {
+      "name": "code_quality",
+      "display_name": "Code Quality",
+      "description": "Readability, naming conventions, and structural organization. Deduct for deeply nested logic or unclear variable names."
+    },
+    {
+      "name": "test_coverage",
+      "display_name": "Test Coverage",
+      "description": "Presence and quality of unit and integration tests. Score based on whether critical paths are tested."
+    },
+    {
+      "name": "performance",
+      "display_name": "Performance",
+      "description": "Efficiency of algorithms and resource usage. Deduct for unnecessary loops, redundant queries, or memory leaks."
+    }
+  ]
+}
+```
+
+#### Notes
+- Reserved names (`requirement_coverage`, `correctness`) are silently filtered from the request — you cannot override defaults.
+- Each call **replaces all** existing custom metrics atomically.
+- If more than 3 custom metrics are sent, only the first 3 are saved and a `warning` field is included in the response.
+- The `description` field is optional but **strongly recommended** — it is passed to the LLM so it knows what each metric should evaluate.
 
 ---
 
@@ -260,6 +364,7 @@ cp .env.example .env
 ### 5. Run Migrations & Verify
 ```bash
 python manage.py check
+python manage.py makemigrations evaluator
 python manage.py migrate
 ```
 
@@ -275,3 +380,4 @@ python manage.py runserver 0.0.0.0:8000
 1. **Git Repository Path Errors**: Ensure `repository_path` is an absolute path accessible on the host filesystem where the Django server is running.
 2. **Commit Resolution**: Ensure `base_commit` and `target_commit` exist in the target repository's Git history.
 3. **Tree-sitter Language Support**: The `tree-sitter-language-pack` handles Python, JavaScript, TypeScript, Java, Go, C++, Rust, PHP, and more. If a language is unsupported, the evaluator automatically falls back to regex or line-range extraction.
+4. **Custom Metrics**: Use the `/api/scoring-metrics/` endpoint to add evaluation dimensions beyond the defaults. Always include a `description` so the LLM can score each metric distinctly.

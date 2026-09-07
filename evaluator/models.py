@@ -12,8 +12,6 @@ class EvaluationResult(models.Model):
     score = models.IntegerField()
     status = models.CharField(max_length=20)
     summary = models.TextField()
-    issues = models.JSONField(default=list)
-    strengths = models.JSONField(default=list)
     rubric = models.JSONField(default=dict)
 
     created_at = models.DateTimeField(auto_now_add=True)
@@ -61,6 +59,7 @@ class ScoringMetric(models.Model):
 
     name = models.CharField(max_length=100, unique=True)
     display_name = models.CharField(max_length=100)
+    description = models.CharField(max_length=255, default="")
 
     class Meta:
         ordering = ["id"]

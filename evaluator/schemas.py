@@ -56,13 +56,11 @@ class EvaluationRequest(BaseModel):
     difficulty: str = "MEDIUM"
 
 
-# ── API response (V1-compatible) ────────────────────────────
+# ── API response ────────────────────────────────────────────
 class EvaluationResponse(BaseModel):
-    """Final evaluation output, preserving V1 contract."""
+    """Final evaluation output."""
 
     score: int
     status: str
     summary: str
-    issues: List[str] = Field(default_factory=list)
-    strengths: List[str] = Field(default_factory=list)
     rubric: dict = Field(default_factory=dict)
